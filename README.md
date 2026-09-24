@@ -4,6 +4,8 @@ Ports the HUD of the November 2011 PS3 development build (`NPXX00207`, BuildLabe
 `2011-11-24-0920_231597_8676`) into the retail PC version of Need for Speed: Most Wanted (2012),
 purely at data level (no exe patch).
 
+![Prototype HUD running in the retail PC game](docs/preview.webp)
+
 > **This repository contains no game files.** Every bundle, texture and text resource is generated from
 > your own copies: you need the PS3 prototype (`NPXX00207`, e.g. running in RPCS3) and the retail PC game.
 > A ready-built file is attached to the [releases](../../releases).
