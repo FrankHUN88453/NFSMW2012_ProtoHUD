@@ -39,7 +39,11 @@ Preview renderer: `python render.py <bundle> <image.png> [--pc]`.
 
 Solved issues: HUD memory budget (prototype RGBA textures re-encoded as BC3, orphaned retail resources
 pruned); minimap `UISubImage` NULL pointer (retail sub-images + round mask); unknown data bindings
-(`sanitize.py`); DamageLights Lua script → `PlaySequenceFast_ScreenScript`.
+(`sanitize.py`); DamageLights Lua script → `PlaySequenceFast_ScreenScript`; minimap roads clipped to a
+small, offset circle (v1.1: the minimap shader samples its mask with 0..1 UVs, so the mask is now a
+generated disc that fills the whole texture).
+
+Releases: **v1.0** first working version · **v1.1** minimap shows the full road network.
 
 ## What the build does (free-drive HUD only: `371621` = prototype `FREEDRIVEHUD`)
 

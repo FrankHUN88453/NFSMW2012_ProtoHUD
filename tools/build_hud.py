@@ -14,9 +14,14 @@ import sys
 import zlib
 from collections import Counter
 
+import numpy as np
+
 sys.path.insert(0, os.path.dirname(__file__))
 import paths
-from assets import RenderableFactory, genesys_resource, raster_ps3_to_pc, renderable_ps3_to_pc, textfile_ps3_to_pc
+from assets import (RenderableFactory, genesys_resource, pc_raster_header, raster_ps3_to_pc, renderable_ps3_to_pc,
+                    textfile_ps3_to_pc)
+from bc3 import encode_bc3
+from raster import DXGI_BC3
 from bnd2 import Bundle, OutResource, from_entry, write_bundle
 from convert import Converter
 from defaults import build as build_defaults
@@ -318,9 +323,9 @@ class Builder:
         walk(node, fn)
 
     def fix_minimap(self, node):
-        """Retail UIElement_MiniMap dereferences two UISubImage sub-elements (mask + player arrow) that the
+        """Retail UIElement_MiniMap dereferences two UISubImage sub-elements (mask + line brush) that the
         prototype schema lacks -> NULL pointer crash. Borrow them from the retail minimap and turn the mask
-        into the prototype's round 'Map Bed' disc at the element's size."""
+        into a round one at the element's size."""
         if not hasattr(self, 'mm_template'):
             ln = self.pc_node(GC | 1206246)
             self.mm_template = next(e for e in ln.fields[0x03378d4f] if e.type == MINIMAP_TYPE)
@@ -336,10 +341,26 @@ class Builder:
             mask = n.fields[0x4d61736b].fields[0xf2c348ff]
             mask.fields[0xbe43cf21] = n.fields.get(0xbe43cf21)   # width
             mask.fields[0xe6417114] = n.fields.get(0xe6417114)   # height
+            # the minimap shader samples its mask with 0..1 UVs (the retail mask fills the whole texture), so
+            # the prototype disc texture (circle in the top-left 78% of a padded 256px texture) would come out
+            # shifted and too small. Use a generated disc that fills the texture; keep the retail 0..1 quad.
             rd = mask.fields[0x9c8f13f0]
-            rd.fields[0x6b74c124] = Ref(zlib.crc32(b'500432_texture'))
-            rd.fields[0x6b739c66] = [Ref(zlib.crc32(b'27837_500432_renderable'))]
+            rd.fields[0x6b74c124] = Ref(self.round_mask_texture())
         walk(node, fn)
+
+    def round_mask_texture(self, size=256, feather=0.05):
+        """Black disc mask filling the whole texture (alpha 255 inside, soft edge), BC3 like retail."""
+        rid = zlib.crc32(b'protohud_minimap_round_mask_texture')
+        if rid not in self.out:
+            yy, xx = np.mgrid[0:size, 0:size]
+            r = np.hypot(xx + 0.5 - size / 2, yy + 0.5 - size / 2) / (size / 2)
+            alpha = np.clip((1.0 - r) / feather, 0.0, 1.0)
+            rgba = np.zeros((size, size, 4), np.uint8)
+            rgba[..., 3] = (alpha * 255).round().astype(np.uint8)
+            self.out[rid] = OutResource(rid, 0x01, [pc_raster_header(DXGI_BC3, size, size), encode_bc3(rgba), b'', b''],
+                                        aligns=(4, 4, 0, 0))
+            self.report['generated round minimap mask'] += 1
+        return rid
 
     def rename_scripts(self, node):
         def fn(n):
