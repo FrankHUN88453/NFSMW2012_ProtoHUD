@@ -1,0 +1,12 @@
+# Game data (EA/Criterion property) and anything derived from it - never commit
+*.BNDL
+*.bndl
+out/
+backup/
+cache/
+preview/
+*.dmp
+
+# Python
+__pycache__/
+*.pyc
