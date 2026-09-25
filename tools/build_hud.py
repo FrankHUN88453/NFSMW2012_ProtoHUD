@@ -21,7 +21,7 @@ import paths
 from assets import (RenderableFactory, genesys_resource, lua_ps3_to_pc, pc_raster_header, raster_ps3_to_pc,
                     renderable_ps3_to_pc, textfile_ps3_to_pc)
 from bc3 import encode_bc3
-from raster import DXGI_BC3
+from raster import DXGI_BC3, decode_pc
 from bnd2 import Bundle, OutResource, from_entry, write_bundle
 from convert import Converter
 from defaults import build as build_defaults
@@ -46,8 +46,23 @@ RETAIL_REMOVE_LAYOUTS = {
     # minimap frame, pursuit bar, heat meter, road name, 'PURSUIT: n SP' score line
     'AdditionalHUD': [1206246, 581357, 1213038, 1990196, 955232],
     'HUD': [979928],                                        # speed-point (SP) counter, top centre
+    # always-on EasyDrive prompt (d-pad, EASYDRIVE, NEW); the EasyDrive widget keeps its own copy of this
+    # layout, so the header still appears while the menu is open
+    'Prompt': [1805584],
 }
+# retail layouts kept but never shown ('Signals.False' visibility, as retail itself uses): the SPEEDWALL
+# panels the POI widget pins to speed cameras and billboards (clamped to the screen edge when off-screen)
+# (layout, from widget, to widget, insert before layout): the EasyDrive tab background (bar + d-pad ring) lives
+# in the always-on EngineOffHud widget; moved under the EasyDrive header so it only shows with the open menu
+MOVE_RETAIL_LAYOUTS = [(1135036, 'EngineOffHud', 'EasyDrive', 1805584)]
+HIDE_RETAIL_LAYOUTS = {995550: 'speed camera speedwall panel', 1315430: 'billboard speedwall panel'}
 RETAIL_CLEAR_WIDGETS = ['Nitrous', 'MapOverlay']            # retail speedo/nitro, minimap overlay
+# The POI widget places the minimap icons; retail's map is rectangular ('SQUARE'), so off-map icons were
+# clamped to the corners of the round prototype map. UIMapCameraConfig.Shape: 0 ROUND, 1 SQUARE (JSON names).
+POI_WIDGET = 371384
+# offline player arrow on the minimap (POI visual 371788 -> layout 371789, element 371790): retail's is green
+PLAYER_MARKER_LAYOUT, PLAYER_MARKER_ELEMENT = 371789, 371790
+H_MAP_CONFIG, H_MAP_SHAPE, MAP_SHAPE_ROUND = 0x0e636ecb, 0xac42bdf0, 0
 # The game activates exactly one of five 'Nitrous' widget groups depending on the car's nitrous mod; four of
 # them carry a nitro bar. The prototype nitro gauge goes into those four, so it only shows with nitrous.
 NITRO_LAYOUT = 500333
@@ -75,6 +90,7 @@ MATERIAL_TEMPLATE = GC | 27876                  # retail UIAdditiveShader materi
 PURSUIT_LAYOUT = 581357
 HEAT_LAYOUT = 390430
 HEAT_RING_CENTRE = (252.0, 660.0)   # centre of the prototype 'Heat Level Bed' ring
+HEAT_SHIFT_X = 18.0                 # the heat ring touched the minimap compass ring on PC -> move it right
 # prototype-only resources that must not be dropped
 DROP_TYPES = {
     0x010000000003f3c0,  # WaveSequenceItem (PS3 audio not ported)
@@ -234,6 +250,17 @@ class Builder:
         found = Counter()
 
         is_nitro = lambda e: isinstance(e.fields.get(H_LAYOUT_ID), Ref) and e.fields[H_LAYOUT_ID].id == GC | NITRO_LAYOUT
+        entry_of = lambda e, lid: isinstance(e.fields.get(H_LAYOUT_ID), Ref) and e.fields[H_LAYOUT_ID].id == GC | lid
+        moving = {}           # layout -> entry node taken from its source widget
+
+        def take(n):
+            for lid, src, dst, before in MOVE_RETAIL_LAYOUTS if self.removals else []:
+                if n.fields.get(H_NAME) == src and H_LAYOUTS in n.fields:
+                    for e in n.fields[H_LAYOUTS] or []:
+                        if entry_of(e, lid):
+                            moving[lid] = e
+                    n.fields[H_LAYOUTS] = [e for e in n.fields[H_LAYOUTS] or [] if not entry_of(e, lid)]
+        walk(root, take)
         nitro_entries = [e for e in entries if is_nitro(e)] if self.removals else []
         hud_entries = [e for e in entries if not (self.removals and is_nitro(e))]
         self.nitro_in_widgets = bool(nitro_entries)
@@ -260,6 +287,15 @@ class Builder:
             if self.removals and name in RETAIL_CLEAR_WIDGETS and H_LAYOUTS in n.fields:
                 n.fields[H_LAYOUTS] = []
                 found[f'clear {name}'] += 1
+            for lid, src, dst, before in MOVE_RETAIL_LAYOUTS if self.removals else []:
+                if name == dst and H_LAYOUTS in n.fields and lid in moving:
+                    entries_ = list(n.fields[H_LAYOUTS] or [])
+                    at = next((i for i, e in enumerate(entries_) if entry_of(e, before)), len(entries_))
+                    n.fields[H_LAYOUTS] = entries_[:at] + [copy.deepcopy(moving[lid])] + entries_[at:]
+                    found[f'moved {lid} {src}->{dst}'] += 1
+            if self.removals and n.fields.get(H_ID) == POI_WIDGET and isinstance(n.fields.get(H_MAP_CONFIG), Node):
+                n.fields[H_MAP_CONFIG].fields[H_MAP_SHAPE] = MAP_SHAPE_ROUND
+                found['POI map shape ROUND'] += 1
 
         walk(root, fix)
         self.log(f'patched retail root: {dict(found)}')
@@ -286,6 +322,7 @@ class Builder:
         self.out[rid] = json_resource(rid, j)
         hud_json = rid
         patched = ['HUD']
+        moved_json, pending_dst = {}, {}     # MOVE_RETAIL_LAYOUTS: entry taken from the source widget JSON
         for en in self.bp.entries:
             if en.type_id != 0x70:
                 continue
@@ -304,10 +341,31 @@ class Builder:
                 j['Layouts'] = [e for e in j.get('Layouts', []) if e['Layout'] not in RETAIL_REMOVE_LAYOUTS[name]]
             elif name in RETAIL_CLEAR_WIDGETS:
                 j['Layouts'] = nitro_layout if (self.nitro_in_widgets and en.id in nitro_json) else []
+            elif name == 'POI' and isinstance(j.get('Map configuration'), dict):
+                j['Map configuration']['Shape'] = 'ROUND'
+            elif any(name in (m[1], m[2]) for m in MOVE_RETAIL_LAYOUTS):
+                for lid, src, dst, before in MOVE_RETAIL_LAYOUTS:
+                    lays = j.get('Layouts', [])
+                    if name == src:
+                        moved_json[lid] = next((e for e in lays if e['Layout'] == lid), moved_json.get(lid))
+                        j['Layouts'] = [e for e in lays if e['Layout'] != lid]
+                    elif name == dst:
+                        pending_dst[lid] = (en.id, before)
+                if name not in [m[1] for m in MOVE_RETAIL_LAYOUTS]:
+                    continue          # destination JSONs are written once the moved entry is known
             else:
                 continue
             self.out[en.id] = json_resource(en.id, j)
             patched.append(name)
+        for lid, (rid, before) in pending_dst.items():
+            if moved_json.get(lid) is None:
+                continue
+            j = read_json(self.bp, rid)
+            lays = j.get('Layouts', [])
+            at = next((i for i, e in enumerate(lays) if e['Layout'] == before), len(lays))
+            j['Layouts'] = lays[:at] + [moved_json[lid]] + lays[at:]
+            self.out[rid] = json_resource(rid, j)
+            patched.append(j.get('Name'))
         for wid in self.widget_ids:
             n3 = self.get_ps3(GC | wid)
             name = n3.fields.get(H_NAME) if n3 is not None else None
@@ -507,6 +565,44 @@ class Builder:
                 p.fields[0x756e6f4f] = 1        # justification: CENTRE (0 LEFT, 1 CENTRE, 2 RIGHT, 3 FULL)
                 self.report['tweak: heat digit centred'] += 1
 
+        # 3) the whole heat meter (rings, masks, glows, label) a little to the right, clear of the minimap
+        lay = objs.get(GC | HEAT_LAYOUT)
+        for el in (lay.fields.get(0x03378d4f) or []) if lay else []:
+            if isinstance(el, Node) and isinstance(el.fields.get(0x12d3a8aa), float):
+                el.fields[0x12d3a8aa] += HEAT_SHIFT_X
+                self.report['tweak: heat meter moved right'] += 1
+
+    def hide_retail_layouts(self, objs):
+        for lid, what in HIDE_RETAIL_LAYOUTS.items():
+            layout = self.pc_node(GC | lid)
+            for el in layout.fields.get(0x03378d4f) or []:
+                if isinstance(el, Node) and 0x3f8d03d7 in el.fields:
+                    el.fields[0x3f8d03d7] = 'Signals.False'
+            objs[GC | lid] = self.new_objects[GC | lid] = layout
+            self.report[f'hidden: {what}'] += 1
+
+    def white_player_marker(self, objs):
+        """Recolour the retail green player arrow white: a new texture with the same shape (brightness of the
+        green arrow, normalised so the body is pure white and the glow stays a soft grey) under a new id, so the
+        green original that other screens load stays untouched."""
+        layout = self.pc_node(GC | PLAYER_MARKER_LAYOUT)
+        el = next(e for e in layout.fields[0x03378d4f] if e.fields.get(H_ID) == PLAYER_MARKER_ELEMENT)
+        rd = el.fields[0x9c8f13f0]
+        src = rd.fields[0x6b74c124].id
+        c = self.bp.load(self.bp.by_id[src])
+        rgba = decode_pc(c[0], c[1]).astype(np.float32)
+        v = rgba[..., :3].max(-1)
+        body = v[rgba[..., 3] > 200]
+        v = np.clip(v / (body.max() if body.size else 255.0), 0, 1) * 255
+        out = np.dstack([v, v, v, rgba[..., 3]]).round().astype(np.uint8)
+        rid = zlib.crc32(b'protohud_player_marker_white')
+        h, w = out.shape[:2]
+        self.out[rid] = OutResource(rid, 0x01, [pc_raster_header(DXGI_BC3, w, h), encode_bc3(out), b'', b''],
+                                    aligns=(4, 4, 0, 0))
+        rd.fields[0x6b74c124] = Ref(rid)
+        objs[GC | PLAYER_MARKER_LAYOUT] = self.new_objects[GC | PLAYER_MARKER_LAYOUT] = layout
+        self.report['white player marker'] += 1
+
     def fix_fonts(self, objs):
         """Prototype text styles use the digits-only font as primary and a per-language font as fallback;
         on PC those fallbacks are CJK/unused, so words never render. Styles used by any word label get the
@@ -705,6 +801,9 @@ class Builder:
             self.sanitizer.fix_node(n, self.TP)
         self.fix_fonts(objs)
         self.apply_tweaks(objs)
+        if self.removals:
+            self.white_player_marker(objs)
+            self.hide_retail_layouts(objs)
         # non-Genesys assets referenced by the new objects
         rids = set()
         for n in objs.values():

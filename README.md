@@ -51,6 +51,19 @@ python exe_patch.py --restore
 - Shadows and the mirror's render-target resolution are decided in code (in the prototype the
   resolution is a compile-time constant, `KU32_REARVIEWMIRROR_WIDTH/HEIGHT`) and are not adjustable.
 
+### Optional: other retail HUD clutter (changes retail game files, backups go to `backup\`)
+
+```bat
+python game_patch.py --apply speedcam-callout   :: hide the 'SPEED CAMERA  185.9 km/h' callout at the car
+python game_patch.py --status
+python game_patch.py --restore
+```
+
+The callout is a feedback sequence outside the HUD bundle (`EN_US\FEEDBACKGROUPS\457707.BNDL` and
+`457708.BNDL`, layouts 1205033 and 1695744); its elements get the `Signals.False` visibility that retail
+itself uses. Objects are rewritten with the Genesys writer only after it reproduced the untouched object
+byte for byte, and the patched bundle is read back and compared before it replaces the original.
+
 ## Status (2026-09-25)
 
 - **Works in game** (offline): `python build_hud.py` → `out\UI\SCREENS2\371621.BNDL` (prototype HUD +
@@ -67,7 +80,15 @@ pruned); minimap `UISubImage` NULL pointer (retail sub-images + round mask); unk
 small, offset circle (v1.1: the minimap shader samples its mask with 0..1 UVs, so the mask is now a
 generated disc that fills the whole texture); pursuit-arc words invisible (v1.2: the prototype styles use
 a digits-only font and a per-language fallback that is a CJK font on PC; word labels now use the retail
-sans font); white, see-through mirror (v1.2: see *Rear-view mirror* below).
+sans font); white, see-through mirror (v1.2: see *Rear-view mirror* below); off-map minimap icons
+stuck in the corners of the round map (the POI widget clamps icons to its map shape, which retail sets to
+`SQUARE`; now `ROUND`).
+
+Not possible: the prototype's TIME gauge was the **Speedbreaker** (slow motion, `RechargedFraction[4]`,
+`E_SLOWMO_REASON_SPEEDBREAKER`). Retail still has a disabled `NitrousParameters.SpeedbreakerUsage` block
+in `GAMELOGIC\GAMEPLAY.BNDL`, but enabling it has no effect in game, so the code is gone; controls are
+also code-only (no data names the horn or nitrous inputs). The prototype's debug menu (`CgsDev::DebugUI`)
+exists only in its INTERNAL/ARTIST executables, not in the retail `NFS13.exe`.
 
 Releases: **v1.0** first working version · **v1.1** minimap shows the full road network ·
 **v1.2** pursuit texts, nitro gauge only with nitrous, rear-view mirror, cleanup.
@@ -93,12 +114,21 @@ Removed on the retail side: layouts of the `Nitrous` widgets (retail speedometer
 979928 (SP counter), and from `AdditionalHUD` 1206246 (minimap frame), 581357 (pursuit bar), 1213038 (heat
 meter), 1990196 (road name), 955232 (pursuit score), plus `MapOverlay`.
 
+Retail clutter without a prototype counterpart (the prototype had no EasyDrive, speed cameras or in-world
+Speedwall):
+- **EasyDrive tab** only with the open menu: its layout 1805584 leaves the always-on `Prompt` widget (the
+  `EasyDrive` widget keeps its own copy), and the tab background 1135036 moves from the always-on
+  `EngineOffHud` widget into `EasyDrive`, under the header.
+- **SPEEDWALL panels** that the POI widget pins to speed cameras and billboards (995550, 1315430) are
+  hidden (`Signals.False`).
+- The **player arrow** on the minimap is white instead of retail green (new texture, same shape).
+
 Left out: weapon counters, HUD sound effects (PS3 audio format), the `HudSelect` HUD variants, and
 prototype layout 287202 (debug collision messages such as `15/-4 TRAF (R/FL)`).
 
 Look fixes (`apply_tweaks`): pursuit words use the regular-weight retail font 2 px smaller without
-outline, COOLDOWN/BUSTING get a smaller style so they fit under the arc, and the heat-level digit is
-centred in its ring.
+outline, COOLDOWN/BUSTING get a smaller style so they fit under the arc, the heat-level digit is
+centred in its ring, and the whole heat meter sits 18 px further right, clear of the minimap compass ring.
 
 ### Rear-view mirror
 
