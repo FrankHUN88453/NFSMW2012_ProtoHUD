@@ -18,8 +18,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
 import paths
-from assets import (RenderableFactory, genesys_resource, pc_raster_header, raster_ps3_to_pc, renderable_ps3_to_pc,
-                    textfile_ps3_to_pc)
+from assets import (RenderableFactory, genesys_resource, lua_ps3_to_pc, pc_raster_header, raster_ps3_to_pc,
+                    renderable_ps3_to_pc, textfile_ps3_to_pc)
 from bc3 import encode_bc3
 from raster import DXGI_BC3
 from bnd2 import Bundle, OutResource, from_entry, write_bundle
@@ -35,16 +35,46 @@ ROOT = GC | 371621
 PROTO_BUNDLE = 'FREEDRIVEHUD.BNDL'
 RETAIL_BUNDLE = '371621.BNDL'
 
-# prototype layouts shown by the 'HUD' widget (mirror 384341 and weapons 500330 are left out)
-PROTO_LAYOUTS = [384049, 565204, 500315, 500332, 500333, 581357, 390430, 390584, 287202, 457813]
+# prototype layouts shown by the 'HUD' widget (the mirror 384341 is added by build_mirror; weapons 500330 are left out)
+# 287202 (Mode.BattlingDamageMessages: debug collision text like '15/-4 TRAF (R/FL)') is left out
+PROTO_LAYOUTS = [384049, 565204, 500315, 500332, 500333, 581357, 390430, 390584, 457813]
 PROTO_WIDGETS = [469629, 287529]           # SpeedoImages (ImagePalette), DamageLights (PlaySequence)
 HUD_GROUP = 264948
 HUD_WIDGET = 264947
 # retail layouts replaced by the prototype ones
 RETAIL_REMOVE_LAYOUTS = {
-    'AdditionalHUD': [1206246, 581357, 1213038, 1990196],  # minimap frame, pursuit bar, heat meter, road name
+    # minimap frame, pursuit bar, heat meter, road name, 'PURSUIT: n SP' score line
+    'AdditionalHUD': [1206246, 581357, 1213038, 1990196, 955232],
+    'HUD': [979928],                                        # speed-point (SP) counter, top centre
 }
 RETAIL_CLEAR_WIDGETS = ['Nitrous', 'MapOverlay']            # retail speedo/nitro, minimap overlay
+# The game activates exactly one of five 'Nitrous' widget groups depending on the car's nitrous mod; four of
+# them carry a nitro bar. The prototype nitro gauge goes into those four, so it only shows with nitrous.
+NITRO_LAYOUT = 500333
+NITROUS_WIDGETS_WITH_NITRO = {1524923, 1524924, 1524925, 1524926}   # 1524951 = car without nitrous
+# Fonts: retail text styles only use these; the prototype's language fallback fonts are CJK/unused on PC.
+RETAIL_FONTS = {1206239, 1206240, 1022113, 1206237, 1206238, 1022112, 581007, 1347399}
+DIGIT_FONT = 581007      # digital 7-segment font, digits only (speed, gear)
+TEXT_FONT = 1206237      # retail HUD sans, bold (also used by the retail BUSTING label)
+PURSUIT_WORD_FONT = 1206238   # retail HUD sans, regular weight
+PURSUIT_CENTRE_WORDS = {390465, 457919}   # loc ids of COOLDOWN, BUSTING (centred under the arc)
+PURSUIT_CENTRE_WORD_SIZE = 12.0
+# rear-view mirror (on by default, --no-mirror leaves it out)
+MIRROR_LAYOUT = 384341
+MIRROR_WIDGET_ID = 264840
+MIRROR_SCRIPT = 'RearViewMirror'
+MIRROR_PARAMS_ID = 264843
+MIRROR_LUA_ASSET = 264841
+LUA_SCRIPT_PARAMS_TYPE = 0x01000000001c6d70     # generic retail Lua script params layout (DoMultipleRpcs)
+REF_REMAP = {}
+# the prototype mirror UIMaterial 96924 uses material 27889, which retail's GLOBALMATERIALDICTIONARY dropped;
+# the shader it points to (UIRearViewMirrorShader, tone-mapped) is still in retail SHADERS.BNDL -> rebuild it
+MIRROR_MATERIAL = GC | 27889
+MIRROR_SHADER = 0x010000530000797e
+MATERIAL_TEMPLATE = GC | 27876                  # retail UIAdditiveShader material, same 64-byte layout
+PURSUIT_LAYOUT = 581357
+HEAT_LAYOUT = 390430
+HEAT_RING_CENTRE = (252.0, 660.0)   # centre of the prototype 'Heat Level Bed' ring
 # prototype-only resources that must not be dropped
 DROP_TYPES = {
     0x010000000003f3c0,  # WaveSequenceItem (PS3 audio not ported)
@@ -54,7 +84,7 @@ DROP_TYPES = {
     0x0100000000046205,  # Widget_WeaponsAndPerks
 }
 FONT_REMAP = {565195: 581007, 384588: 581007, 384589: 581007, 581351: 581007, 581352: 581007, 97106: 97111}
-MATERIAL_REMAP = {0x0100000000006cf1: 0x0100000000006ce4}   # mirror material missing in retail
+MATERIAL_REMAP = {}
 TEXTSTYLE_FONT_FIELDS = (0x0ad87231, 0xc455a691)
 
 SCRIPT_RENAME = {'PlaySequence': 'PlaySequenceFast'}   # prototype Lua scripts -> retail native scripts
@@ -147,7 +177,8 @@ class Builder:
         self.sanitizer = BindingSanitizer()
         self.pc_index, _ = pickle.load(open(os.path.join(paths.CACHE, 'index_pc.pkl'), 'rb'))
         self.cache3 = {}
-        self.conv = Converter(self.T3, self.TP, self.defaults, self.get_ps3, type_map=SCRIPT_TYPE_MAP)
+        self.conv = Converter(self.T3, self.TP, self.defaults, self.get_ps3, type_map=SCRIPT_TYPE_MAP,
+                              ref_remap=REF_REMAP)
         self.out = {}          # rid -> OutResource (new/replaced)
         self.report = Counter()
 
@@ -202,11 +233,21 @@ class Builder:
         root = self.pc_node(ROOT)
         found = Counter()
 
+        is_nitro = lambda e: isinstance(e.fields.get(H_LAYOUT_ID), Ref) and e.fields[H_LAYOUT_ID].id == GC | NITRO_LAYOUT
+        nitro_entries = [e for e in entries if is_nitro(e)] if self.removals else []
+        hud_entries = [e for e in entries if not (self.removals and is_nitro(e))]
+        self.nitro_in_widgets = bool(nitro_entries)
+
         def fix(n):
             name = n.fields.get(H_NAME)
             if n.fields.get(H_ID) == HUD_WIDGET and H_LAYOUTS in n.fields:
-                n.fields[H_LAYOUTS] = list(n.fields[H_LAYOUTS] or []) + entries
+                n.fields[H_LAYOUTS] = list(n.fields[H_LAYOUTS] or []) + hud_entries
                 found['HUD'] += 1
+            if self.removals and name == 'Nitrous' and H_LAYOUTS in n.fields:
+                with_nitro = n.fields.get(H_ID) in NITROUS_WIDGETS_WITH_NITRO
+                n.fields[H_LAYOUTS] = [copy.deepcopy(e) for e in nitro_entries] if with_nitro else []
+                found['nitro gauge -> Nitrous' if with_nitro else 'clear Nitrous (no nitro)'] += 1
+                return
             if n.fields.get(H_ID) == HUD_GROUP and H_WIDGETS in n.fields:
                 n.fields[H_WIDGETS] = list(n.fields[H_WIDGETS] or []) + widgets
                 found['group'] += 1
@@ -234,9 +275,16 @@ class Builder:
         j = read_json(self.bp, rid)
         if add_layouts:
             wanted = getattr(self, 'only_layouts', None) or PROTO_LAYOUTS
+            if self.nitro_in_widgets:
+                wanted = [l for l in wanted if l != NITRO_LAYOUT]
             j['Layouts'] = j.get('Layouts', []) + [{'Layout': l, 'LayoutInstanceParams': params[l]}
                                                    for l in wanted if l in params]
+        nitro_json = {json_name('Nitrous', w) for w in NITROUS_WIDGETS_WITH_NITRO}
+        nitro_layout = [{'Layout': NITRO_LAYOUT, 'LayoutInstanceParams': params[NITRO_LAYOUT]}]
+        if self.removals:
+            j['Layouts'] = [e for e in j['Layouts'] if e['Layout'] not in RETAIL_REMOVE_LAYOUTS.get('HUD', [])]
         self.out[rid] = json_resource(rid, j)
+        hud_json = rid
         patched = ['HUD']
         for en in self.bp.entries:
             if en.type_id != 0x70:
@@ -248,12 +296,14 @@ class Builder:
             if not isinstance(j, dict):
                 continue
             name = j.get('Name')
+            if en.id == hud_json:
+                continue
             if not self.removals:
                 continue
             if name in RETAIL_REMOVE_LAYOUTS:
                 j['Layouts'] = [e for e in j.get('Layouts', []) if e['Layout'] not in RETAIL_REMOVE_LAYOUTS[name]]
             elif name in RETAIL_CLEAR_WIDGETS:
-                j['Layouts'] = []
+                j['Layouts'] = nitro_layout if (self.nitro_in_widgets and en.id in nitro_json) else []
             else:
                 continue
             self.out[en.id] = json_resource(en.id, j)
@@ -370,6 +420,126 @@ class Builder:
                 self.report['script renamed'] += 1
         walk(node, fn)
 
+    def build_mirror(self):
+        """Rear-view mirror. The prototype's Widget_RearViewMirror type is gone from retail, but the renderer
+        still has the mirror passes and Lua can call SetRearViewMirrorRender. Recreate the widget as a
+        retail Widget_Default running the prototype's REARVIEWMIRROR.LUA (bytecode is identical on PS3/PC)
+        with a retail-style function whitelist. Returns the widget node for the HUD widget group."""
+        root = self.pc_node(ROOT)
+        template = []
+
+        def find(n):
+            if not template and n.fields.get(H_NAME) == 'WreckCam':
+                template.append(n)
+        walk(root, find)
+        widget = copy.deepcopy(template[0])                       # a retail Widget_Default
+        wtype = self.TP[widget.type]
+        script_f = next(f for f in wtype.fields if f.name_hash == 0xb21bc985)
+        script = Node(script_f.type_id, 0)
+        for f in self.TP[script_f.type_id].fields:
+            script.fields[f.name_hash] = None
+        script.fields.update({H_NAME: MIRROR_SCRIPT, 0x0f3ba334: Ref(GC | MIRROR_PARAMS_ID), H_ID: 0})
+        widget.fields.update({H_NAME: 'Mirror', H_ID: MIRROR_WIDGET_ID, 0xb21bc985: [script], 0x58f4df78: None,
+                              0x1f3e2f69: 1})
+        params = Node(LUA_SCRIPT_PARAMS_TYPE, 0)
+        for f in self.TP[LUA_SCRIPT_PARAMS_TYPE].fields:
+            params.fields[f.name_hash] = None
+        params.fields.update({H_ID: MIRROR_PARAMS_ID, 0xf4e46c1f: ['SetRearViewMirrorRender'],   # Lua whitelist
+                              0xca319217: MIRROR_LUA_ASSET, 0x29751313: 1})
+        self.new_objects[GC | MIRROR_PARAMS_ID] = params
+        # the Lua bytecode is loaded by name: crc32('<script>.lua')
+        lua_rid = zlib.crc32(f'{MIRROR_SCRIPT.lower()}.lua'.encode())
+        self.out[lua_rid] = lua_ps3_to_pc(lua_rid, self.b3.load(self.b3.by_id[lua_rid])[0])
+        rid = json_name('Mirror', MIRROR_WIDGET_ID)
+        self.out[rid] = json_resource(rid, {
+            'LayoutLayer': 'MIDGROUND', 'ModalMode': 'E_NON_MODAL', 'Name': 'Mirror',
+            'Scripts': [{'Name': MIRROR_SCRIPT, 'Script': {'LuaAsset': MIRROR_LUA_ASSET}}]})
+        self.report['mirror widget + REARVIEWMIRROR.LUA'] += 1
+        return widget
+
+    def apply_tweaks(self, objs):
+        """Hand-tuned look fixes found by in-game testing."""
+        ts = next(t.id for t in self.TP.values() if t.name == 'Genesys.Gen.TextStyle')
+
+        def labels(layout_id):
+            lay = objs.get(GC | layout_id)
+            for el in (lay.fields.get(0x03378d4f) or []) if lay else []:
+                s, p = el.fields.get(0x59b9b833), el.fields.get(0x1c843549)
+                if isinstance(el, Node) and isinstance(s, Node) and isinstance(p, Node):
+                    yield el, s, p
+
+        # 1) pursuit arc words (BUSTED/EVADE/COOLDOWN/BUSTING): regular weight, 2px smaller, no outline.
+        #    The cop count shares the prototype style, so it gets an untouched copy.
+        words = [p for _, s, p in labels(PURSUIT_LAYOUT) if s.fields.get(0xcb33ade5)]
+        numbers = [p for _, s, p in labels(PURSUIT_LAYOUT) if not s.fields.get(0xcb33ade5)]
+        style_ids = {p.fields[0xed2dd6a7].id for p in words if isinstance(p.fields.get(0xed2dd6a7), Ref)}
+        for sid in style_ids:
+            style = objs.get(sid)
+            if style is None or style.type != ts:
+                continue
+            copy_id = zlib.crc32(f'protohud_style_{sid & 0xFFFFFFFF}_numbers'.encode())
+            objs[copy_id] = self.new_objects[copy_id] = copy.deepcopy(style)   # new_objects: resolvable
+            for p in numbers:
+                if isinstance(p.fields.get(0xed2dd6a7), Ref) and p.fields[0xed2dd6a7].id == sid:
+                    p.fields[0xed2dd6a7] = Ref(copy_id)
+            for h in (0x0ad87231, 0xc455a691, 0x8f0782e6, 0x1e1d146c):   # all font slots
+                style.fields[h] = PURSUIT_WORD_FONT
+            style.fields[0xb2500964] = (style.fields.get(0xb2500964) or 18.0) - 2.0   # size
+            style.fields[0xeb0f3510] = 0     # text effect: none (was a black outline)
+            style.fields[0x76d2b46c] = 1.0   # effect thickness, as retail
+            self.report['tweak: pursuit words thinner/smaller'] += 1
+            # COOLDOWN / BUSTING sit under the arc: the retail font is much larger per point than the
+            # prototype's 581352, so at 16 they overflow the arc -> own, smaller style
+            centre_id = zlib.crc32(f'protohud_style_{sid & 0xFFFFFFFF}_centre'.encode())
+            centre = objs[centre_id] = self.new_objects[centre_id] = copy.deepcopy(style)
+            centre.fields[0xb2500964] = PURSUIT_CENTRE_WORD_SIZE
+            for _, s, p in labels(PURSUIT_LAYOUT):
+                if s.fields.get(0xcb33ade5) in PURSUIT_CENTRE_WORDS:
+                    p.fields[0xed2dd6a7] = Ref(centre_id)
+            self.report['tweak: COOLDOWN/BUSTING smaller'] += 1
+
+        # 2) heat level digit (and its ghost '8'): centre it in the ring instead of right-aligning it
+        for el, s, p in labels(HEAT_LAYOUT):
+            text = s.fields.get(0xf0f72a2f) or ''
+            if 'HeatLevelInt' in text or text == 'Signals.GetIntValue[8]':
+                el.fields[0x12d3a8aa], el.fields[0x12d3a8ab] = HEAT_RING_CENTRE
+                el.fields[0x9f543ffd] = 4       # anchor: centre
+                p.fields[0x756e6f4f] = 1        # justification: CENTRE (0 LEFT, 1 CENTRE, 2 RIGHT, 3 FULL)
+                self.report['tweak: heat digit centred'] += 1
+
+    def fix_fonts(self, objs):
+        """Prototype text styles use the digits-only font as primary and a per-language font as fallback;
+        on PC those fallbacks are CJK/unused, so words never render. Styles used by any word label get the
+        retail HUD sans; purely numeric styles keep the digital font."""
+        TS = next(t.id for t in self.TP.values() if t.name == 'Genesys.Gen.TextStyle')
+        wordy = set()
+
+        def label(n):
+            s, props = n.fields.get(0x59b9b833), n.fields.get(0x1c843549)
+            if not isinstance(s, Node) or not isinstance(props, Node):
+                return
+            st = props.fields.get(0xed2dd6a7)
+            if not isinstance(st, Ref):
+                return
+            text, loc = s.fields.get(0xf0f72a2f) or '', s.fields.get(0xcb33ade5) or 0
+            numeric = bool(re.match(r'^(Signals\.GetIntValue|Players\.[\w.]*(Speed|Gear|HeatLevelInt|CopsInChase|'
+                                    r'AmmoCount|Timer|ChaseHeat)\b)', text)) or re.fullmatch(r'[\d\s.:,-]*', text) is not None
+            if loc or not numeric:
+                wordy.add(st.id)
+        for n in objs.values():
+            walk(n, label)
+        for rid, n in objs.items():
+            if n.type != TS:
+                continue
+            f1, f2 = n.fields.get(0x0ad87231), n.fields.get(0xc455a691)
+            if rid in wordy:
+                new = (TEXT_FONT, TEXT_FONT)
+            else:
+                new = tuple(f if f in RETAIL_FONTS else (f1 if f1 in RETAIL_FONTS else DIGIT_FONT) for f in (f1, f2))
+            if new != (f1, f2):
+                n.fields[0x0ad87231], n.fields[0xc455a691] = new
+                self.report[f'font {f1}/{f2} -> {new[0]}/{new[1]}'] += 1
+
     def remap_fonts(self, node):
         def fn(n):
             if self.TP.get(n.type) is not None and self.TP[n.type].name.endswith('TextStyle'):
@@ -394,6 +564,8 @@ class Builder:
                 elif en.type_id == 0x05:
                     res, mat = renderable_ps3_to_pc(fac, rid, self.b3, en, MATERIAL_REMAP)
                     self.out[rid] = res
+                    if mat == MIRROR_MATERIAL:
+                        self.mirror_material()
                 elif en.type_id == 0x70:
                     if en.name.upper().endswith('.LUA'):
                         self.report['lua asset skipped'] += 1   # PS3 Lua bytecode; retail uses native scripts
@@ -405,6 +577,20 @@ class Builder:
                 self.report[f'asset {en.type_id:#x}'] += 1
             except NotImplementedError as ex:
                 self.report[f'asset failed: {ex}'] += 1
+
+    def mirror_material(self):
+        """Material 27889 in retail format: {u32 id, u8 0, u8 4, u16 import offset, ...} + shader import."""
+        if MIRROR_MATERIAL in self.out:
+            return
+        gmd = Bundle(os.path.join(paths.PC_ROOT, 'GLOBALMATERIALDICTIONARY.BNDL'))
+        res = from_entry(gmd, gmd.by_id[MATERIAL_TEMPLATE])
+        body = bytearray(res.chunks[0])
+        assert struct.unpack_from('<I', body, 0)[0] == MATERIAL_TEMPLATE & 0xFFFFFFFF
+        struct.pack_into('<I', body, 0, MIRROR_MATERIAL & 0xFFFFFFFF)
+        struct.pack_into('<Q', body, res.import_offset, MIRROR_SHADER)
+        res.id, res.chunks, res.stream = MIRROR_MATERIAL, [bytes(body)] + list(res.chunks[1:]), 0
+        self.out[MIRROR_MATERIAL] = res
+        self.report['mirror material 27889 (UIRearViewMirrorShader)'] += 1
 
     def resolvable(self, rid):
         if rid in self.out or rid in self.bp.by_id or rid in self.new_objects:
@@ -474,10 +660,11 @@ class Builder:
         self.log(f'pruned {len(drop)} orphaned retail resources ({kb} KB graphics memory)')
         return [r for r in resources if r.id not in drop]
 
-    def build(self, out_path, variant='full'):
+    def build(self, out_path, variant='full', mirror=True):
         """variant: full (release: prototype layouts, no extra widgets) | with-widgets (+SpeedoImages, DamageLights)
         | damage-only / speedo-only (+ one widget) | add-only (retail HUD kept) | tacho-only | patch-only | roundtrip"""
         self.new_objects = {}
+        self.mirror = mirror
         self.prune = variant in ('full', 'with-widgets', 'damage-only', 'speedo-only', 'patch-only')
         if variant == 'roundtrip':
             write_bundle(out_path, [from_entry(self.bp, e) for e in self.bp.entries], self.bp.root_id,
@@ -495,9 +682,13 @@ class Builder:
             self.removals = False
         elif variant == 'tacho-only':
             self.removals, layouts = False, [500315]
+        if self.mirror:
+            layouts = layouts + [MIRROR_LAYOUT]
         self.only_layouts = layouts
         self.widget_ids = widget_ids
         entries, widgets = self.convert_proto_parts(layouts, widget_ids)
+        if self.mirror:
+            widgets = widgets + [self.build_mirror()]
         if variant == 'patch-only':
             entries, widgets = [], []
             self.conv.handle_refs.clear()
@@ -512,6 +703,8 @@ class Builder:
                 self.bake_palette(n)
                 self.fix_minimap(n)
             self.sanitizer.fix_node(n, self.TP)
+        self.fix_fonts(objs)
+        self.apply_tweaks(objs)
         # non-Genesys assets referenced by the new objects
         rids = set()
         for n in objs.values():
@@ -559,10 +752,11 @@ def main():
     ap.add_argument('--variant', default='full', choices=['roundtrip', 'patch-only', 'add-only', 'tacho-only', 'full', 'with-widgets', 'damage-only',
                              'speedo-only'],
                     help='full = release build (prototype HUD without the two extra widgets)')
+    ap.add_argument('--no-mirror', dest='mirror', action='store_false', help='leave out the rear-view mirror')
     args = ap.parse_args()
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     b = Builder(print)
-    conv_report, report = b.build(args.out, args.variant)
+    conv_report, report = b.build(args.out, args.variant, mirror=args.mirror)
     print('build report:', dict(report))
     with open(os.path.join(paths.OUT, 'conversion_report.json'), 'w') as f:
         json.dump({k: dict(v) for k, v in conv_report.items()} | {'build': dict(report)}, f, indent=1)

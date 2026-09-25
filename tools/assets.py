@@ -103,6 +103,17 @@ def textfile_ps3_to_pc(rid, data):
     return OutResource(rid, 0x70, [body, b'', b'', b''], aligns=(4, 0, 0, 0))
 
 
+def lua_ps3_to_pc(rid, data):
+    """Lua 5.1 bytecode TextFile: u32 length + bytecode. The bytecode itself is identical on PS3 and PC
+    (both little-endian 'LuaQ' with 4/4/4/8 sizes); only the length prefix changes endianness."""
+    n = struct.unpack('>I', data[:4])[0]
+    code = data[4:4 + n]
+    assert code[:5] == b'\x1bLuaQ' and code[6] == 1, 'expected little-endian Lua 5.1 bytecode'
+    body = struct.pack('<I', n) + code + b'\0'
+    body += b'\0' * ((-len(body)) % 16)
+    return OutResource(rid, 0x70, [body, b'', b'', b''], aligns=(4, 0, 0, 0))
+
+
 def genesys_resource(rid, data, imports, type_id=0x15):
     c0, ioff, icnt = pack_imports(data, imports)
     return OutResource(rid, type_id, [c0, b'', b'', b''], ioff, icnt, aligns=(4, 0, 0, 0))

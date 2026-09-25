@@ -35,12 +35,13 @@ def is_array(f):
 
 
 class Converter:
-    def __init__(self, T3, TP, defaults, ps3_objects, type_map=None):
+    def __init__(self, T3, TP, defaults, ps3_objects, type_map=None, ref_remap=None):
         """ps3_objects: callable rid -> PS3 Node (or None) used to embed referenced prototype objects."""
         self.T3, self.TP = T3, TP
         self.defaults = defaults
         self.get_ps3 = ps3_objects
         self.type_map = {**TYPE_MAP, **(type_map or {})}
+        self.ref_remap = dict(ref_remap or {})
         self.report = defaultdict(Counter)
         self.handle_refs = set()   # prototype objects that must become separate PC resources
         self.enum_cache = {}
@@ -149,6 +150,8 @@ class Converter:
         # handles and references ---------------------------------------------
         if kind == 8:
             if isinstance(x, Ref):
+                if x.id in self.ref_remap:
+                    x = Ref(self.ref_remap[x.id])
                 self.note_ref(x.id)
                 return x
             if isinstance(x, int) and x:
