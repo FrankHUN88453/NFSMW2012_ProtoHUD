@@ -2,8 +2,12 @@
 
 Ports the HUD of the November 2011 PS3 development build (`NPXX00207`, BuildLabel
 `2011-11-24-0920_231597_8676`) into the retail PC version of Need for Speed: Most Wanted (2012),
-including the prototype's rear-view mirror. The HUD itself is a pure data mod (one bundle); two optional
-tools tune the mirror's draw distance and rendering quality.
+including the prototype's rear-view mirror, its HUD animations and its damage indicator lights, on every
+HUD screen: free roam, races, Speed Run, Ambush and the multiplayer screens. The HUD is a pure data mod
+(one bundle per screen); optional tools tune the mirror and hide retail clutter.
+
+A version without the rear-view mirror lives on the [`no-mirror`](../../tree/no-mirror) branch (same
+builder, the mirror is simply off by default there; `python build_hud.py --no-mirror` does the same here).
 
 ![Prototype HUD running in the retail PC game](docs/preview.webp)
 
@@ -21,14 +25,27 @@ tools tune the mirror's draw distance and rendering quality.
 
 ```bat
 cd tools
-python index.py ps3 pc      :: once: build the resource index (cache/)
-python build_hud.py         :: produce out\UI\SCREENS2\371621.BNDL
-python install.py           :: install (the original file is backed up to backup\)
-python install.py --restore :: restore the original
+python index.py ps3 pc                :: once: build the resource index (cache/)
+python build_hud.py --target all      :: every HUD screen -> out\UI\SCREENS2\<id>.BNDL
+python build_hud.py                   :: free roam only (371621); --target race|speedrun|ambush|mp|mp_<id>
+python install.py                     :: install everything built (originals backed up to backup\ first)
+python install.py --restore           :: restore the originals
 ```
 
+Options: `--no-mirror` (no rear-view mirror), `--no-damage-lights` (no damage indicator), `--out-root DIR`
+(build into `DIR\UI\SCREENS2\`, e.g. `out\variants\no-mirror`; `install.py --variant no-mirror` installs it).
 Preview renderer: `python render.py <bundle> <image.png> [--pc]`.
-`python build_hud.py --no-mirror` builds the HUD without the rear-view mirror.
+
+| Target | Retail screen | Prototype source | Notes |
+|---|---|---|---|
+| `freedrive` | 371621 free roam | FREEDRIVEHUD | |
+| `race` | 604153 sprint / circuit | BLACKLISTHUD | prototype race clock 390231 (target + current time) replaces retail TIME; rival panels moved under it |
+| `speedrun` | 371678 | FREEDRIVEHUD | retail target speed, distance, rivals and event timer kept |
+| `ambush` | 371670 | FREEDRIVEHUD | retail ambush target / own time kept |
+| `mp_371720`, `mp_371725`, `mp_1019407`, `mp_1019757`, `mp_1019814` | multiplayer | FREEDRIVEHUD | retail minimap frame and road name removed from the shared `PersistentHUD`; rank/points, point status and WRONG WAY move below the mirror |
+
+On every screen retail's WRONG WAY / CHECKPOINT MISSED and other top-centre readouts move below the mirror
+only when the mirror is built in.
 
 ### Optional: rear-view mirror tuning (changes retail game files, backups go to `backup\`)
 
@@ -66,11 +83,11 @@ byte for byte, and the patched bundle is read back and compared before it replac
 
 ## Status (2026-09-25)
 
-- **Works in game** (offline): `python build_hud.py` → `out\UI\SCREENS2\371621.BNDL` (prototype HUD +
-  rear-view mirror, without the two extra widgets). Tested: `roundtrip` OK, `tacho-only` OK, release
-  build OK, mirror OK (with both optional tools applied).
-- Experimental: `--variant damage-only | speedo-only | with-widgets` (DamageLights damage indicators,
-  SpeedoImages per-car dial).
+- **Works in game** (offline): the free-roam screen 371621 (prototype HUD + rear-view mirror), tested
+  release by release; mirror OK (with both optional tools applied).
+- **Built, not yet tested in game**: the race, Speed Run, Ambush and multiplayer screens, the damage
+  indicator lights and the prototype layout transitions.
+- Experimental: `--variant speedo-only | with-widgets` (SpeedoImages per-car dial).
 - **The base game also crashes in online mode** (EA app friends list → Origin SDK, `NFS13.exe+0x77da80`),
   independently of the mod: put the EA app into offline mode.
 
@@ -93,7 +110,7 @@ exists only in its INTERNAL/ARTIST executables, not in the retail `NFS13.exe`.
 Releases: **v1.0** first working version · **v1.1** minimap shows the full road network ·
 **v1.2** pursuit texts, nitro gauge only with nitrous, rear-view mirror, cleanup.
 
-## What the build does (free-drive HUD only: `371621` = prototype `FREEDRIVEHUD`)
+## What the build does (shown for the free-roam screen `371621`; the other screens follow the same pattern)
 
 The retail widget structure is kept (EasyDrive, POI icons, prompts and the recommendation ticker keep
 working); the visual HUD is replaced:
@@ -129,6 +146,30 @@ prototype layout 287202 (debug collision messages such as `15/-4 TRAF (R/FL)`).
 Look fixes (`apply_tweaks`): pursuit words use the regular-weight retail font 2 px smaller without
 outline, COOLDOWN/BUSTING get a smaller style so they fit under the arc, the heat-level digit is
 centred in its ring, and the whole heat meter sits 18 px further right, clear of the minimap compass ring.
+
+### Animations
+
+- **Element timelines** (29 in the prototype HUD) are converted as they are: heat-meter flashes on
+  `HeatProgress` changes, the second half-ring fading in and out, pursuit-arc states. Colour behaviours
+  (`TO,<palette name>`) only take palette names and retail repainted two of them (`HUD_BED` red → dark
+  blue, `HUD_PURSUIT_HEATFILL` brown-orange → red), so they point at the closest retail entries
+  (`HUD_GLITCH_LARGE`, `HUD_MINIMAP_PBHAZARD`) and the heat ring rests on that same colour.
+- **Layout transitions**: retail's layout parameters (99985 / 99990) slide the HUD in (`APPROACH`) but also
+  carry the HUD aspect correction and the impact shake (`Camera.GameplayExternalImpactShakeAngles`, the
+  retail counterpart of the prototype's `SHAKE` on collisions). They are forked with the prototype's
+  `FADE(0, 400, IN, EASEINOUT)`, and the other prototype layouts get the impact shake as well. The
+  prototype's EMP shake and radar-jam fade have no retail source (weapons were cut).
+- **Damage indicator lights** (`DamageLights`, three lights left of the tachometer): the prototype widget
+  with its 8 sequences, driven by `Players.LocalPlayer.DamageBarState` (0..3) and `IsHealthRecharging`,
+  which the retail binding table still has.
+
+### Shared retail objects
+
+POI visuals, their layouts and many layout parameters are shared by a dozen retail screens under the same
+resource ids, and the game uses whichever loaded copy it finds first (e.g. the resident map screens').
+Edited shared objects are therefore forked under private ids (`0x7Fxxxxxx`) and the referencing widgets
+(Genesys and widget JSON) are pointed at the forks: the white player arrow, the prototype-transition
+layout parameters and the retail layouts moved below the mirror or the race clock.
 
 ### Rear-view mirror
 

@@ -31,16 +31,14 @@ from gwrite import Writer
 from sanitize import BindingSanitizer
 
 GC = 1 << 56
-ROOT = GC | 371621
-PROTO_BUNDLE = 'FREEDRIVEHUD.BNDL'
-RETAIL_BUNDLE = '371621.BNDL'
 
 # prototype layouts shown by the 'HUD' widget (the mirror 384341 is added by build_mirror; weapons 500330 are left out)
 # 287202 (Mode.BattlingDamageMessages: debug collision text like '15/-4 TRAF (R/FL)') is left out
 PROTO_LAYOUTS = [384049, 565204, 500315, 500332, 500333, 581357, 390430, 390584, 457813]
 PROTO_WIDGETS = [469629, 287529]           # SpeedoImages (ImagePalette), DamageLights (PlaySequence)
-HUD_GROUP = 264948
-HUD_WIDGET = 264947
+# DamageLights: the prototype's animated damage indicator (8 sequences driven by Players.LocalPlayer.DamageBarState
+# 0..3 and IsHealthRecharging, both still in the retail binding table); part of the default build
+DAMAGE_LIGHTS_WIDGET = 287529
 # retail layouts replaced by the prototype ones
 RETAIL_REMOVE_LAYOUTS = {
     # minimap frame, pursuit bar, heat meter, road name, 'PURSUIT: n SP' score line
@@ -50,16 +48,27 @@ RETAIL_REMOVE_LAYOUTS = {
     # layout, so the header still appears while the menu is open
     'Prompt': [1805584],
 }
-# retail layouts kept but never shown ('Signals.False' visibility, as retail itself uses): the SPEEDWALL
-# panels the POI widget pins to speed cameras and billboards (clamped to the screen edge when off-screen)
 # (layout, from widget, to widget, insert before layout): the EasyDrive tab background (bar + d-pad ring) lives
 # in the always-on EngineOffHud widget; moved under the EasyDrive header so it only shows with the open menu
-MOVE_RETAIL_LAYOUTS = [(1135036, 'EngineOffHud', 'EasyDrive', 1805584)]
-HIDE_RETAIL_LAYOUTS = {995550: 'speed camera speedwall panel', 1315430: 'billboard speedwall panel'}
+# (multiplayer screens keep the same tab background in their HudSelect widget)
+MOVE_RETAIL_LAYOUTS = [(1135036, ('EngineOffHud', 'HudSelect'), 'EasyDrive', 1805584)]
+# POI visuals (and the layouts they show) are shared by a dozen retail screens with the same resource ids, and the
+# game uses whichever loaded copy it finds first (e.g. the resident map screens'). Edited POI objects are therefore
+# forked under private ids and the POI widget is pointed at the forks.
+PLAYER_POI_VISUAL = 371788
+H_POI_VISUALS = 0xf7dfe43b
+# Layout instance params: the prototype fades its HUD layouts in and shakes them on impacts/EMP; retail slides
+# them in (APPROACH) and shakes them through a transform component bound to the camera impact shake, next to the
+# HUD aspect correction. The prototype layouts get the prototype transition on retail params (forked, as retail
+# layouts share these ids) and every one gets the retail impact shake. EMP / radar-jam timelines have no retail source.
+H_LAYOUT_PARAMS = 0xecc08889
+H_TRANSITION, H_TRANSITION_TEXT, H_TRANSFORMS, H_TRANSFORM_BINDING = 0xac3e9556, 0xaedfbe15, 0x83cf15e9, 0xf0f72a2f
+IMPACT_SHAKE_BINDING = 'Camera.GameplayExternalImpactShakeAngles'
+IMPACT_SHAKE_TEMPLATE = 99985           # retail params whose transform list carries the impact shake component
 RETAIL_CLEAR_WIDGETS = ['Nitrous', 'MapOverlay']            # retail speedo/nitro, minimap overlay
 # The POI widget places the minimap icons; retail's map is rectangular ('SQUARE'), so off-map icons were
 # clamped to the corners of the round prototype map. UIMapCameraConfig.Shape: 0 ROUND, 1 SQUARE (JSON names).
-POI_WIDGET = 371384
+POI_WIDGETS = {371384, 1013546}         # single player / multiplayer screens
 # offline player arrow on the minimap (POI visual 371788 -> layout 371789, element 371790): retail's is green
 PLAYER_MARKER_LAYOUT, PLAYER_MARKER_ELEMENT = 371789, 371790
 H_MAP_CONFIG, H_MAP_SHAPE, MAP_SHAPE_ROUND = 0x0e636ecb, 0xac42bdf0, 0
@@ -91,6 +100,11 @@ PURSUIT_LAYOUT = 581357
 HEAT_LAYOUT = 390430
 HEAT_RING_CENTRE = (252.0, 660.0)   # centre of the prototype 'Heat Level Bed' ring
 HEAT_SHIFT_X = 18.0                 # the heat ring touched the minimap compass ring on PC -> move it right
+# Timeline colour behaviours ('TO,<palette name>') only take palette names, and retail repainted these two:
+# HUD_BED red -> dark blue, HUD_PURSUIT_HEATFILL brown-orange -> red. Heat-meter flashes would turn blue and the
+# ring would jump to retail red after the first flash. Use the closest retail entries (hue first) instead; an
+# element whose resting colour is such a target gets that retail colour as its baked tint, so nothing jumps.
+TIMELINE_COLOUR_MAP = {'HUD_BED': 'HUD_GLITCH_LARGE', 'HUD_PURSUIT_HEATFILL': 'HUD_MINIMAP_PBHAZARD'}
 # prototype-only resources that must not be dropped
 DROP_TYPES = {
     0x010000000003f3c0,  # WaveSequenceItem (PS3 audio not ported)
@@ -178,20 +192,74 @@ def prune_refs(v, ok, dropped):
     return v
 
 
+class Target:
+    """One retail HUD screen and the prototype HUD screen it is rebuilt from."""
+
+    def __init__(self, retail, proto, proto_root, proto_group, proto_hud, retail_group, retail_hud,
+                 extra_layouts=(), remove=None, move_down=None, mirror_moves=None):
+        self.retail, self.proto = retail, proto
+        self.proto_root, self.proto_group, self.proto_hud = proto_root, proto_group, proto_hud
+        self.retail_group, self.retail_hud = retail_group, retail_hud
+        self.layouts = PROTO_LAYOUTS + list(extra_layouts)
+        self.remove = remove if remove is not None else RETAIL_REMOVE_LAYOUTS
+        self.move_down = move_down or {}          # retail layout -> pixels to move it down
+        self.mirror_moves = mirror_moves or {}    # ... only when the mirror (top centre) is built in
+
+
+TARGETS = {
+    # free drive: retail 371621 = prototype FREEDRIVEHUD (same ids on both sides)
+    'freedrive': Target(371621, 'FREEDRIVEHUD.BNDL', 371621, 264948, 264947, 264948, 264947),
+    # races (sprint/circuit: LAP, POSITION): retail 604153. The prototype had no separate race HUD; its
+    # BLACKLISTHUD is the free-drive HUD plus the race clock 390231 (target time + current time, top right),
+    # which replaces retail's TIME (1470152). Retail's WRONG WAY / CHECKPOINT MISSED (1106106) sits where the
+    # mirror is and moves below it; the rival panels (Recommends 1132827, speedwall target 1470201) move below
+    # the taller prototype clock.
+    'race': Target(604153, 'BLACKLISTHUD.BNDL', 371666, 264935, 264936, 604154, 604156,
+                   extra_layouts=[390231],
+                   remove=dict(RETAIL_REMOVE_LAYOUTS,
+                               AdditionalHUD=RETAIL_REMOVE_LAYOUTS['AdditionalHUD'] + [1470152]),
+                   move_down={1132827: 40.0, 1470201: 40.0}, mirror_moves={1106106: 120.0}),
+    # speed run / ambush: the free-drive prototype HUD; their own retail readouts (target speed, distance,
+    # ambush target/own time, rivals, event timer) stay, so no prototype clock here (it would sit on top of them)
+    'speedrun': Target(371678, 'FREEDRIVEHUD.BNDL', 371621, 264948, 264947, 264935, 264936,
+                       mirror_moves={1106106: 120.0}),
+    'ambush': Target(371670, 'FREEDRIVEHUD.BNDL', 371621, 264948, 264947, 390664, 390665),
+}
+# multiplayer screens keep minimap frame and road name in a shared PersistentHUD widget; rank/points, point status
+# and WRONG WAY sit at the top centre and move below the mirror when it is built in
+MP_REMOVE = dict(RETAIL_REMOVE_LAYOUTS, PersistentHUD=[1206246, 1990196])
+MP_MOVE = {1956204: 115.0, 682103: 100.0, 1106106: 120.0}
+for _name, _rid, _group, _hud in (('mp_371720', 371720, 275101, 275109), ('mp_371725', 371725, 286337, 286339),
+                                  ('mp_1019407', 1019407, 1128832, 1019406), ('mp_1019757', 1019757, 1019758, 1019759),
+                                  ('mp_1019814', 1019814, 1019815, 1019816)):
+    TARGETS[_name] = Target(_rid, 'FREEDRIVEHUD.BNDL', 371621, 264948, 264947, _group, _hud,
+                            remove=MP_REMOVE, mirror_moves=MP_MOVE)
+TARGET_GROUPS = {'all': sorted(TARGETS), 'mp': sorted(t for t in TARGETS if t.startswith('mp_'))}
+
+
+_SHARED = {}
+
+
 class Builder:
-    def __init__(self, log):
+    def __init__(self, log, target='freedrive'):
         self.log = log
-        self.ps3b = [Bundle(p) for p in paths.ps3_ui_bundles()]
-        self.pcb = [Bundle(p) for p in paths.pc_ui_bundles()]
-        self.T3 = load_types(self.ps3b)
-        self.TP = load_types(self.pcb)
-        self.defaults = build_defaults(paths.pc_ui_bundles(), self.TP)
-        self.b3 = Bundle(os.path.join(paths.PS3_SCREENS, PROTO_BUNDLE))
-        self.bp = Bundle(paths.retail_path(f'UI/SCREENS2/{RETAIL_BUNDLE}'))  # never the installed mod
-        self.transitions = Bundle(os.path.join(paths.PC_SCREENS, RETAIL_BUNDLE.replace('.BNDL', '_TRANSITIONS.BNDL')))
+        self.t = TARGETS[target]
+        self.root_rid = GC | self.t.retail
+        if not _SHARED:                                   # type tables etc. are the same for every target
+            _SHARED['ps3b'] = [Bundle(p) for p in paths.ps3_ui_bundles()]
+            _SHARED['pcb'] = [Bundle(p) for p in paths.pc_ui_bundles()]
+            _SHARED['T3'] = load_types(_SHARED['ps3b'])
+            _SHARED['TP'] = load_types(_SHARED['pcb'])
+            _SHARED['defaults'] = build_defaults(paths.pc_ui_bundles(), _SHARED['TP'])
+            _SHARED['pc_index'] = pickle.load(open(os.path.join(paths.CACHE, 'index_pc.pkl'), 'rb'))[0]
+        self.ps3b, self.pcb = _SHARED['ps3b'], _SHARED['pcb']
+        self.T3, self.TP, self.defaults = _SHARED['T3'], _SHARED['TP'], _SHARED['defaults']
+        self.b3 = Bundle(os.path.join(paths.PS3_SCREENS, self.t.proto))
+        self.bp = Bundle(paths.retail_path(f'UI/SCREENS2/{self.t.retail}.BNDL'))  # never the installed mod
+        self.transitions = Bundle(os.path.join(paths.PC_SCREENS, f'{self.t.retail}_TRANSITIONS.BNDL'))
         self.removals = True
         self.sanitizer = BindingSanitizer()
-        self.pc_index, _ = pickle.load(open(os.path.join(paths.CACHE, 'index_pc.pkl'), 'rb'))
+        self.pc_index = _SHARED['pc_index']
         self.cache3 = {}
         self.conv = Converter(self.T3, self.TP, self.defaults, self.get_ps3, type_map=SCRIPT_TYPE_MAP,
                               ref_remap=REF_REMAP)
@@ -215,16 +283,16 @@ class Builder:
 
     # -- steps --------------------------------------------------------------
     def convert_proto_parts(self, layouts=None, widget_ids=()):
-        layouts = layouts or PROTO_LAYOUTS
-        proto_root = self.get_ps3(ROOT)
+        layouts = layouts or self.t.layouts
+        proto_root = self.get_ps3(GC | self.t.proto_root)
         hud = groups = None
         for g in proto_root.fields[0x75f05d27]:
             grp = self.get_ps3(g.fields[0xbb52725b].id)
-            if grp.fields[H_ID] == HUD_GROUP:
+            if grp.fields[H_ID] == self.t.proto_group:
                 groups = grp
         for w in groups.fields[H_WIDGETS]:
             n = self.get_ps3(w.id) if isinstance(w, Ref) else w
-            if n is not None and n.fields.get(H_ID) == HUD_WIDGET:
+            if n is not None and n.fields.get(H_ID) == self.t.proto_hud:
                 hud = n
         pc_layout_t = next(f.type_id for f in self.TP[0x010000000004091c].fields if f.name_hash == H_LAYOUTS)
         entries = []
@@ -246,7 +314,7 @@ class Builder:
         return entries, widgets
 
     def patch_retail_root(self, entries, widgets):
-        root = self.pc_node(ROOT)
+        root = self.pc_node(self.root_rid)
         found = Counter()
 
         is_nitro = lambda e: isinstance(e.fields.get(H_LAYOUT_ID), Ref) and e.fields[H_LAYOUT_ID].id == GC | NITRO_LAYOUT
@@ -255,11 +323,9 @@ class Builder:
 
         def take(n):
             for lid, src, dst, before in MOVE_RETAIL_LAYOUTS if self.removals else []:
-                if n.fields.get(H_NAME) == src and H_LAYOUTS in n.fields:
-                    for e in n.fields[H_LAYOUTS] or []:
-                        if entry_of(e, lid):
-                            moving[lid] = e
-                    n.fields[H_LAYOUTS] = [e for e in n.fields[H_LAYOUTS] or [] if not entry_of(e, lid)]
+                if n.fields.get(H_NAME) in src and any(entry_of(e, lid) for e in n.fields.get(H_LAYOUTS) or []):
+                    moving[lid] = next(e for e in n.fields[H_LAYOUTS] if entry_of(e, lid))
+                    n.fields[H_LAYOUTS] = [e for e in n.fields[H_LAYOUTS] if not entry_of(e, lid)]
         walk(root, take)
         nitro_entries = [e for e in entries if is_nitro(e)] if self.removals else []
         hud_entries = [e for e in entries if not (self.removals and is_nitro(e))]
@@ -267,7 +333,7 @@ class Builder:
 
         def fix(n):
             name = n.fields.get(H_NAME)
-            if n.fields.get(H_ID) == HUD_WIDGET and H_LAYOUTS in n.fields:
+            if n.fields.get(H_ID) == self.t.retail_hud and H_LAYOUTS in n.fields:
                 n.fields[H_LAYOUTS] = list(n.fields[H_LAYOUTS] or []) + hud_entries
                 found['HUD'] += 1
             if self.removals and name == 'Nitrous' and H_LAYOUTS in n.fields:
@@ -275,11 +341,11 @@ class Builder:
                 n.fields[H_LAYOUTS] = [copy.deepcopy(e) for e in nitro_entries] if with_nitro else []
                 found['nitro gauge -> Nitrous' if with_nitro else 'clear Nitrous (no nitro)'] += 1
                 return
-            if n.fields.get(H_ID) == HUD_GROUP and H_WIDGETS in n.fields:
+            if n.fields.get(H_ID) == self.t.retail_group and H_WIDGETS in n.fields:
                 n.fields[H_WIDGETS] = list(n.fields[H_WIDGETS] or []) + widgets
                 found['group'] += 1
-            if self.removals and name in RETAIL_REMOVE_LAYOUTS and H_LAYOUTS in n.fields:
-                drop = {GC | x for x in RETAIL_REMOVE_LAYOUTS[name]}
+            if self.removals and name in self.t.remove and H_LAYOUTS in n.fields:
+                drop = {GC | x for x in self.t.remove[name]}
                 before = len(n.fields[H_LAYOUTS] or [])
                 n.fields[H_LAYOUTS] = [e for e in n.fields[H_LAYOUTS] or []
                                        if not (isinstance(e.fields.get(H_LAYOUT_ID), Ref) and e.fields[H_LAYOUT_ID].id in drop)]
@@ -292,8 +358,8 @@ class Builder:
                     entries_ = list(n.fields[H_LAYOUTS] or [])
                     at = next((i for i, e in enumerate(entries_) if entry_of(e, before)), len(entries_))
                     n.fields[H_LAYOUTS] = entries_[:at] + [copy.deepcopy(moving[lid])] + entries_[at:]
-                    found[f'moved {lid} {src}->{dst}'] += 1
-            if self.removals and n.fields.get(H_ID) == POI_WIDGET and isinstance(n.fields.get(H_MAP_CONFIG), Node):
+                    found[f'moved {lid} -> {dst}'] += 1
+            if self.removals and n.fields.get(H_ID) in POI_WIDGETS and isinstance(n.fields.get(H_MAP_CONFIG), Node):
                 n.fields[H_MAP_CONFIG].fields[H_MAP_SHAPE] = MAP_SHAPE_ROUND
                 found['POI map shape ROUND'] += 1
 
@@ -305,12 +371,12 @@ class Builder:
     def patch_json(self, entries):
         add_layouts = bool(entries)
         """Keep the widget-definition JSONs consistent with the patched Genesys widgets."""
-        proto_hud = read_json(self.b3, json_name('HUD', HUD_WIDGET))
+        proto_hud = read_json(self.b3, json_name('HUD', self.t.proto_hud))
         params = {e['Layout']: e['LayoutInstanceParams'] for e in proto_hud['Layouts']}
-        rid = json_name('HUD', HUD_WIDGET)
+        rid = json_name('HUD', self.t.retail_hud)
         j = read_json(self.bp, rid)
         if add_layouts:
-            wanted = getattr(self, 'only_layouts', None) or PROTO_LAYOUTS
+            wanted = getattr(self, 'only_layouts', None) or self.t.layouts
             if self.nitro_in_widgets:
                 wanted = [l for l in wanted if l != NITRO_LAYOUT]
             j['Layouts'] = j.get('Layouts', []) + [{'Layout': l, 'LayoutInstanceParams': params[l]}
@@ -318,7 +384,7 @@ class Builder:
         nitro_json = {json_name('Nitrous', w) for w in NITROUS_WIDGETS_WITH_NITRO}
         nitro_layout = [{'Layout': NITRO_LAYOUT, 'LayoutInstanceParams': params[NITRO_LAYOUT]}]
         if self.removals:
-            j['Layouts'] = [e for e in j['Layouts'] if e['Layout'] not in RETAIL_REMOVE_LAYOUTS.get('HUD', [])]
+            j['Layouts'] = [e for e in j['Layouts'] if e['Layout'] not in self.t.remove.get('HUD', [])]
         self.out[rid] = json_resource(rid, j)
         hud_json = rid
         patched = ['HUD']
@@ -337,21 +403,23 @@ class Builder:
                 continue
             if not self.removals:
                 continue
-            if name in RETAIL_REMOVE_LAYOUTS:
-                j['Layouts'] = [e for e in j.get('Layouts', []) if e['Layout'] not in RETAIL_REMOVE_LAYOUTS[name]]
+            if name in self.t.remove:
+                j['Layouts'] = [e for e in j.get('Layouts', []) if e['Layout'] not in self.t.remove[name]]
             elif name in RETAIL_CLEAR_WIDGETS:
                 j['Layouts'] = nitro_layout if (self.nitro_in_widgets and en.id in nitro_json) else []
             elif name == 'POI' and isinstance(j.get('Map configuration'), dict):
                 j['Map configuration']['Shape'] = 'ROUND'
-            elif any(name in (m[1], m[2]) for m in MOVE_RETAIL_LAYOUTS):
+            elif any(name in m[1] or name == m[2] for m in MOVE_RETAIL_LAYOUTS):
+                src_changed = False
                 for lid, src, dst, before in MOVE_RETAIL_LAYOUTS:
                     lays = j.get('Layouts', [])
-                    if name == src:
-                        moved_json[lid] = next((e for e in lays if e['Layout'] == lid), moved_json.get(lid))
+                    if name in src and any(e['Layout'] == lid for e in lays):
+                        moved_json[lid] = next(e for e in lays if e['Layout'] == lid)
                         j['Layouts'] = [e for e in lays if e['Layout'] != lid]
+                        src_changed = True
                     elif name == dst:
                         pending_dst[lid] = (en.id, before)
-                if name not in [m[1] for m in MOVE_RETAIL_LAYOUTS]:
+                if not src_changed:
                     continue          # destination JSONs are written once the moved entry is known
             else:
                 continue
@@ -386,7 +454,7 @@ class Builder:
 
     def convert_handle_closure(self):
         """Convert every prototype object referenced by handle that the retail bundle does not have."""
-        forced = {GC | x for x in PROTO_LAYOUTS}
+        forced = {GC | x for x in self.t.layouts}
         done = set()
         while True:
             pending = sorted(self.conv.handle_refs - done)
@@ -412,16 +480,46 @@ class Builder:
         if not hasattr(self, 'ps3_palette'):
             from render import load_palette
             self.ps3_palette = load_palette(os.path.join(paths.PS3_ROOT, 'UI', 'UICONFIG.BNDL'))
+            self.pc_palette = load_palette(os.path.join(paths.PC_ROOT, 'UI', 'UICONFIG.BNDL'))
+
+        def timeline_targets(n):
+            """Remap 'TO,<name>' colour behaviours in an element's timelines; returns the target names."""
+            found = set()
+
+            def walk_(v):
+                if isinstance(v, Node):
+                    b = v.fields.get(0x606417cf)
+                    if isinstance(b, str) and b.startswith('TO,'):
+                        target = b[3:]
+                        if target in TIMELINE_COLOUR_MAP:
+                            target = TIMELINE_COLOUR_MAP[target]
+                            v.fields[0x606417cf] = 'TO,' + target
+                            self.report['timeline colour target remapped'] += 1
+                        found.add(target)
+                    for k, x in v.fields.items():
+                        if k != 0x54696e74:
+                            walk_(x)
+                elif isinstance(v, list):
+                    for x in v:
+                        walk_(x)
+            walk_(n.fields.get(0x402057b7))
+            return found
 
         def fn(n):
             tint = n.fields.get(0x54696e74)
+            targets = timeline_targets(n) if 0x402057b7 in n.fields else set()
             if not isinstance(tint, Node):
                 return
             name = tint.fields.get(0x3d9d3579)
             if not name:
                 return
             vec = tint.fields.get(0xb28ad39b) or [1.0, 1.0, 1.0, 1.0]
-            if name in self.ps3_palette:
+            if TIMELINE_COLOUR_MAP.get(name) in targets and TIMELINE_COLOUR_MAP[name] in self.pc_palette:
+                # the element animates back to this colour: rest on the same retail entry
+                pal = self.pc_palette[TIMELINE_COLOUR_MAP[name]]
+                tint.fields[0xb28ad39b] = [a * b for a, b in zip(vec, pal)]
+                self.report['palette baked (timeline target)'] += 1
+            elif name in self.ps3_palette:
                 pal = self.ps3_palette[name]
                 tint.fields[0xb28ad39b] = [a * b for a, b in zip(vec, pal)]
                 self.report['palette baked'] += 1
@@ -483,13 +581,18 @@ class Builder:
         still has the mirror passes and Lua can call SetRearViewMirrorRender. Recreate the widget as a
         retail Widget_Default running the prototype's REARVIEWMIRROR.LUA (bytecode is identical on PS3/PC)
         with a retail-style function whitelist. Returns the widget node for the HUD widget group."""
-        root = self.pc_node(ROOT)
+        root = self.pc_node(self.root_rid)
         template = []
 
-        def find(n):
-            if not template and n.fields.get(H_NAME) == 'WreckCam':
+        def find(n):                                      # WreckCam (tested), else any retail Widget_Default
+            t = self.TP.get(n.type)
+            if t is not None and t.name == 'Genesys.Gen.Widget_Default' and n.fields.get(H_NAME):
                 template.append(n)
         walk(root, find)
+        template.sort(key=lambda n: n.fields.get(H_NAME) != 'WreckCam')
+        if not template:                                  # screen without one: borrow the free-drive WreckCam
+            walk(Reader(Bundle(paths.retail_path('UI/SCREENS2/371621.BNDL')), self.TP).read_resource(
+                Bundle(paths.retail_path('UI/SCREENS2/371621.BNDL')).by_id[GC | 371621]), find)
         widget = copy.deepcopy(template[0])                       # a retail Widget_Default
         wtype = self.TP[widget.type]
         script_f = next(f for f in wtype.fields if f.name_hash == 0xb21bc985)
@@ -572,20 +675,168 @@ class Builder:
                 el.fields[0x12d3a8aa] += HEAT_SHIFT_X
                 self.report['tweak: heat meter moved right'] += 1
 
-    def hide_retail_layouts(self, objs):
-        for lid, what in HIDE_RETAIL_LAYOUTS.items():
-            layout = self.pc_node(GC | lid)
-            for el in layout.fields.get(0x03378d4f) or []:
-                if isinstance(el, Node) and 0x3f8d03d7 in el.fields:
-                    el.fields[0x3f8d03d7] = 'Signals.False'
-            objs[GC | lid] = self.new_objects[GC | lid] = layout
-            self.report[f'hidden: {what}'] += 1
+    def private_id(self, tag):
+        """Stable id above the retail GameChanger range (< 0x00400000) for a forked shared object."""
+        n = 0x7F000000 | (zlib.crc32(f'protohud_{tag}'.encode()) & 0x00FFFFFF)
+        assert (GC | n) not in self.pc_index and (GC | n) not in self.bp.by_id, tag
+        return n
 
-    def white_player_marker(self, objs):
+    def fork(self, objs, old_id, tag):
+        node = copy.deepcopy(objs[GC | old_id]) if (GC | old_id) in objs else self.pc_node(GC | old_id)
+        new = self.private_id(tag)
+        node.fields[H_ID] = new
+        objs[GC | new] = self.new_objects[GC | new] = node
+        return new, node
+
+    @staticmethod
+    def replace_ref(node, old_rid, new_rid):
+        hits = []
+
+        def fn(n):
+            for k, v in n.fields.items():
+                if isinstance(v, Ref) and v.id == old_rid:
+                    n.fields[k] = Ref(new_rid)
+                    hits.append(k)
+                elif isinstance(v, list):
+                    for i, x in enumerate(v):
+                        if isinstance(x, Ref) and x.id == old_rid:
+                            v[i] = Ref(new_rid)
+                            hits.append(k)
+        walk(node, fn)
+        return len(hits)
+
+    def proto_layout_params(self, objs):
+        """Prototype intro transition + retail impact shake on the params of every prototype layout entry."""
+        ours = {GC | x for x in self.only_layouts}
+        shake = None
+        for rid in [GC | IMPACT_SHAKE_TEMPLATE] + [e.id for e in self.bp.entries if e.type_id == 0x15]:
+            if rid not in self.bp.by_id:
+                continue
+            n = self.pc_node(rid)
+            shake = next((c for c in n.fields.get(H_TRANSFORMS) or [] if isinstance(c, Node)
+                          and c.fields.get(H_TRANSFORM_BINDING) == IMPACT_SHAKE_BINDING), None)
+            if shake is not None:
+                break
+        remap = {}
+
+        def proto_transition(pid):
+            n3 = self.get_ps3(GC | pid)
+            tr = n3.fields.get(H_TRANSITION) if n3 is not None else None
+            return tr.fields.get(H_TRANSITION_TEXT) if isinstance(tr, Node) else None
+
+        def params_for(pid):
+            if pid in remap:
+                return remap[pid]
+            if (GC | pid) in self.new_objects:              # converted prototype params: add the retail shake
+                node, new = self.new_objects[GC | pid], pid
+            else:                                           # retail params: fork with the prototype transition
+                new, node = self.fork(objs, pid, f'layout_params_{pid}')
+                text = proto_transition(pid)
+                if text and isinstance(node.fields.get(H_TRANSITION), Node):
+                    node.fields[H_TRANSITION].fields[H_TRANSITION_TEXT] = text
+                    self.report['layout params: prototype transition'] += 1
+            comps = node.fields.get(H_TRANSFORMS) or []
+            if shake is not None and not any(isinstance(c, Node) and c.fields.get(H_TRANSFORM_BINDING) == IMPACT_SHAKE_BINDING for c in comps):
+                node.fields[H_TRANSFORMS] = list(comps) + [copy.deepcopy(shake)]
+                self.report['layout params: retail impact shake added'] += 1
+            remap[pid] = new
+            return new
+
+        def fn(n):
+            lid, par = n.fields.get(H_LAYOUT_ID), n.fields.get(H_LAYOUT_PARAMS)
+            if isinstance(lid, Ref) and lid.id in ours and isinstance(par, Ref):
+                n.fields[H_LAYOUT_PARAMS] = Ref(GC | params_for(par.id & 0xFFFFFFFF))
+        walk(objs[self.root_rid], fn)
+        for rid, res in list(self.out.items()):
+            if res.type_id != 0x70:
+                continue
+            try:
+                j = json.loads(res.chunks[0][4:].split(bytes(1))[0].decode('latin1'))
+            except ValueError:
+                continue
+            if not isinstance(j, dict) or not isinstance(j.get('Layouts'), list):
+                continue
+            changed = False
+            for e in j['Layouts']:
+                if (GC | e.get('Layout', 0)) in ours and e.get('LayoutInstanceParams') in remap:
+                    e['LayoutInstanceParams'] = remap[e['LayoutInstanceParams']]
+                    changed = True
+            if changed:
+                self.out[rid] = json_resource(rid, j)
+
+    def repoint_layout(self, objs, old, new):
+        """Point every widget layout entry (Genesys and widget JSON) at layout `new` instead of `old`."""
+        n_refs = []
+
+        def fn(n):
+            lid = n.fields.get(H_LAYOUT_ID)
+            if isinstance(lid, Ref) and lid.id == GC | old:
+                n.fields[H_LAYOUT_ID] = Ref(GC | new)
+                n_refs.append(1)
+        walk(objs[self.root_rid], fn)
+        for en in self.bp.entries:
+            if en.type_id != 0x70:
+                continue
+            res = self.out.get(en.id)
+            try:
+                j = (json.loads(res.chunks[0][4:].split(bytes(1))[0].decode('latin1')) if res is not None
+                     else read_json(self.bp, en.id))
+            except ValueError:
+                continue
+            if isinstance(j, dict) and any(e.get('Layout') == old for e in j.get('Layouts') or []):
+                for e in j['Layouts']:
+                    if e.get('Layout') == old:
+                        e['Layout'] = new
+                self.out[en.id] = json_resource(en.id, j)
+        return len(n_refs)
+
+    def move_retail_layouts(self, objs):
+        moves = {**self.t.move_down, **(self.t.mirror_moves if self.mirror else {})}
+        for lid, dy in moves.items():
+            if (GC | lid) not in self.bp.by_id:
+                continue
+            new, layout = self.fork(objs, lid, f'moved_{self.t.retail}_{lid}')
+            for el in layout.fields.get(0x03378d4f) or []:
+                if isinstance(el, Node) and isinstance(el.fields.get(0x12d3a8ab), float):
+                    el.fields[0x12d3a8ab] += dy
+            assert self.repoint_layout(objs, lid, new), lid
+            self.report[f'retail layout {lid} moved down {dy:g} px'] += 1
+
+    def repoint_poi(self, objs, remap):
+        """Point the POI widgets (Genesys list and JSON 'PointsOfInterest') at the forked visuals."""
+        if not remap:
+            return
+        widgets = set()
+
+        def fn(n):
+            if n.fields.get(H_ID) in POI_WIDGETS and isinstance(n.fields.get(H_POI_VISUALS), list):
+                for old, new in remap.items():
+                    if self.replace_ref(n, GC | old, GC | new):
+                        widgets.add(n.fields[H_ID])
+        walk(objs[self.root_rid], fn)
+        for wid in sorted(widgets):
+            rid = json_name('POI', wid)
+            res = self.out.get(rid)
+            j = (json.loads(res.chunks[0][4:].split(bytes(1))[0].decode('latin1')) if res is not None
+                 else read_json(self.bp, rid))
+            j['PointsOfInterest'] = [remap.get(x, x) for x in j['PointsOfInterest']]
+            self.out[rid] = json_resource(rid, j)
+            self.report[f'POI widget {wid} repointed to forked visuals'] += 1
+
+    def white_player_marker(self, objs, remap):
         """Recolour the retail green player arrow white: a new texture with the same shape (brightness of the
-        green arrow, normalised so the body is pure white and the glow stays a soft grey) under a new id, so the
-        green original that other screens load stays untouched."""
-        layout = self.pc_node(GC | PLAYER_MARKER_LAYOUT)
+        green arrow, normalised so the body is pure white and the glow stays a soft grey). Texture, layout and POI
+        visual get private ids, so the green originals that other screens load stay untouched."""
+        used = []
+
+        def uses(n):
+            if n.fields.get(H_ID) in POI_WIDGETS and any(isinstance(r, Ref) and r.id == GC | PLAYER_POI_VISUAL
+                                                         for r in n.fields.get(H_POI_VISUALS) or []):
+                used.append(n)
+        walk(objs[self.root_rid], uses)
+        if not used or (GC | PLAYER_MARKER_LAYOUT) not in self.bp.by_id:
+            return
+        new_layout, layout = self.fork(objs, PLAYER_MARKER_LAYOUT, f'player_marker_{PLAYER_MARKER_LAYOUT}')
         el = next(e for e in layout.fields[0x03378d4f] if e.fields.get(H_ID) == PLAYER_MARKER_ELEMENT)
         rd = el.fields[0x9c8f13f0]
         src = rd.fields[0x6b74c124].id
@@ -600,7 +851,9 @@ class Builder:
         self.out[rid] = OutResource(rid, 0x01, [pc_raster_header(DXGI_BC3, w, h), encode_bc3(out), b'', b''],
                                     aligns=(4, 4, 0, 0))
         rd.fields[0x6b74c124] = Ref(rid)
-        objs[GC | PLAYER_MARKER_LAYOUT] = self.new_objects[GC | PLAYER_MARKER_LAYOUT] = layout
+        new_visual, vis = self.fork(objs, PLAYER_POI_VISUAL, f'poi_visual_{PLAYER_POI_VISUAL}')
+        assert self.replace_ref(vis, GC | PLAYER_MARKER_LAYOUT, GC | new_layout) == 1
+        remap[PLAYER_POI_VISUAL] = new_visual
         self.report['white player marker'] += 1
 
     def fix_fonts(self, objs):
@@ -756,7 +1009,7 @@ class Builder:
         self.log(f'pruned {len(drop)} orphaned retail resources ({kb} KB graphics memory)')
         return [r for r in resources if r.id not in drop]
 
-    def build(self, out_path, variant='full', mirror=True):
+    def build(self, out_path, variant='full', mirror=True, damage_lights=True):
         """variant: full (release: prototype layouts, no extra widgets) | with-widgets (+SpeedoImages, DamageLights)
         | damage-only / speedo-only (+ one widget) | add-only (retail HUD kept) | tacho-only | patch-only | roundtrip"""
         self.new_objects = {}
@@ -767,7 +1020,9 @@ class Builder:
                          self.bp.header_tail, flags=self.bp.flags)
             self.log(f'wrote {out_path} (roundtrip)')
             return self.conv.report, self.report
-        layouts, widget_ids = PROTO_LAYOUTS, []
+        layouts, widget_ids = self.t.layouts, []
+        if variant == 'full' and damage_lights:
+            widget_ids = [DAMAGE_LIGHTS_WIDGET]
         if variant == 'with-widgets':
             widget_ids = PROTO_WIDGETS
         elif variant == 'damage-only':
@@ -791,19 +1046,22 @@ class Builder:
         root = self.patch_retail_root(entries, widgets)
         self.convert_handle_closure()
         objs = dict(self.new_objects)
-        objs[ROOT] = root
+        objs[self.root_rid] = root
         for rid, n in objs.items():
             self.remap_fonts(n)
             self.rename_scripts(n)
-            if rid != ROOT:
+            if rid != self.root_rid:
                 self.bake_palette(n)
                 self.fix_minimap(n)
             self.sanitizer.fix_node(n, self.TP)
         self.fix_fonts(objs)
         self.apply_tweaks(objs)
         if self.removals:
-            self.white_player_marker(objs)
-            self.hide_retail_layouts(objs)
+            remap = {}
+            self.white_player_marker(objs, remap)
+            self.repoint_poi(objs, remap)
+            self.proto_layout_params(objs)
+            self.move_retail_layouts(objs)
         # non-Genesys assets referenced by the new objects
         rids = set()
         for n in objs.values():
@@ -847,18 +1105,30 @@ class Builder:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--out', default=os.path.join(paths.OUT, 'UI', 'SCREENS2', RETAIL_BUNDLE))
+    ap.add_argument('--target', default='freedrive', choices=sorted(TARGETS) + sorted(TARGET_GROUPS),
+                    help='freedrive = 371621 (free roam), race = 604153 (sprint/circuit), speedrun = 371678, '
+                         'ambush = 371670, mp_* = multiplayer screens; groups: all, mp')
+    ap.add_argument('--out', help='default: <out root>/UI/SCREENS2/<retail id>.BNDL')
+    ap.add_argument('--out-root', default=paths.OUT, help='folder that receives UI/SCREENS2/ (default: out/)')
     ap.add_argument('--variant', default='full', choices=['roundtrip', 'patch-only', 'add-only', 'tacho-only', 'full', 'with-widgets', 'damage-only',
                              'speedo-only'],
                     help='full = release build (prototype HUD without the two extra widgets)')
     ap.add_argument('--no-mirror', dest='mirror', action='store_false', help='leave out the rear-view mirror')
+    ap.add_argument('--no-damage-lights', dest='damage_lights', action='store_false',
+                    help='leave out the animated damage indicator (DamageLights)')
     args = ap.parse_args()
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
-    b = Builder(print)
-    conv_report, report = b.build(args.out, args.variant, mirror=args.mirror)
-    print('build report:', dict(report))
-    with open(os.path.join(paths.OUT, 'conversion_report.json'), 'w') as f:
-        json.dump({k: dict(v) for k, v in conv_report.items()} | {'build': dict(report)}, f, indent=1)
+    targets = TARGET_GROUPS.get(args.target, [args.target])
+    if args.out and len(targets) > 1:
+        ap.error('--out needs a single target')
+    for target in targets:
+        out = args.out or os.path.join(args.out_root, 'UI', 'SCREENS2', f'{TARGETS[target].retail}.BNDL')
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        print(f'=== {target}')
+        b = Builder(print, target)
+        conv_report, report = b.build(out, args.variant, mirror=args.mirror, damage_lights=args.damage_lights)
+        print('build report:', dict(report))
+        with open(os.path.join(paths.OUT, f'conversion_report_{target}.json'), 'w') as f:
+            json.dump({k: dict(v) for k, v in conv_report.items()} | {'build': dict(report)}, f, indent=1)
 
 
 if __name__ == '__main__':
