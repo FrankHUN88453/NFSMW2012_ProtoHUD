@@ -111,7 +111,9 @@ also code-only (no data names the horn or nitrous inputs). The prototype's debug
 exists only in its INTERNAL/ARTIST executables, not in the retail `NFS13.exe`.
 
 Releases: **v1.0** first working version · **v1.1** minimap shows the full road network ·
-**v1.2** pursuit texts, nitro gauge only with nitrous, rear-view mirror, cleanup.
+**v1.2** pursuit texts, nitro gauge only with nitrous, rear-view mirror, cleanup ·
+**v1.3** every HUD screen (races, Speed Run, Ambush, multiplayer), prototype animations, damage lights,
+round minimap icons, and a version without the mirror (branch `no-mirror`, separate zip).
 
 ## What the build does (shown for the free-roam screen `371621`; the other screens follow the same pattern)
 
