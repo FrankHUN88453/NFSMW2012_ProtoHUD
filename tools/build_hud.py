@@ -83,7 +83,7 @@ TEXT_FONT = 1206237      # retail HUD sans, bold (also used by the retail BUSTIN
 PURSUIT_WORD_FONT = 1206238   # retail HUD sans, regular weight
 PURSUIT_CENTRE_WORDS = {390465, 457919}   # loc ids of COOLDOWN, BUSTING (centred under the arc)
 PURSUIT_CENTRE_WORD_SIZE = 12.0
-# rear-view mirror (on by default, --no-mirror leaves it out)
+# rear-view mirror (off on the no-mirror branch, --mirror adds it)
 MIRROR_LAYOUT = 384341
 MIRROR_WIDGET_ID = 264840
 MIRROR_SCRIPT = 'RearViewMirror'
@@ -1009,7 +1009,7 @@ class Builder:
         self.log(f'pruned {len(drop)} orphaned retail resources ({kb} KB graphics memory)')
         return [r for r in resources if r.id not in drop]
 
-    def build(self, out_path, variant='full', mirror=True, damage_lights=True):
+    def build(self, out_path, variant='full', mirror=False, damage_lights=True):
         """variant: full (release: prototype layouts, no extra widgets) | with-widgets (+SpeedoImages, DamageLights)
         | damage-only / speedo-only (+ one widget) | add-only (retail HUD kept) | tacho-only | patch-only | roundtrip"""
         self.new_objects = {}
@@ -1113,7 +1113,8 @@ def main():
     ap.add_argument('--variant', default='full', choices=['roundtrip', 'patch-only', 'add-only', 'tacho-only', 'full', 'with-widgets', 'damage-only',
                              'speedo-only'],
                     help='full = release build (prototype HUD without the two extra widgets)')
-    ap.add_argument('--no-mirror', dest='mirror', action='store_false', help='leave out the rear-view mirror')
+    # no-mirror branch: the rear-view mirror is off by default
+    ap.add_argument('--mirror', dest='mirror', action='store_true', help='add the prototype rear-view mirror')
     ap.add_argument('--no-damage-lights', dest='damage_lights', action='store_false',
                     help='leave out the animated damage indicator (DamageLights)')
     args = ap.parse_args()

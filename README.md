@@ -6,8 +6,11 @@ including the prototype's rear-view mirror, its HUD animations and its damage in
 HUD screen: free roam, races, Speed Run, Ambush and the multiplayer screens. The HUD is a pure data mod
 (one bundle per screen); optional tools tune the mirror and hide retail clutter.
 
-A version without the rear-view mirror lives on the [`no-mirror`](../../tree/no-mirror) branch (same
-builder, the mirror is simply off by default there; `python build_hud.py --no-mirror` does the same here).
+> **`no-mirror` branch:** this branch builds the HUD **without the rear-view mirror** (same builder, the
+> mirror is off by default; `python build_hud.py --mirror` adds it back). The version with the mirror is on
+> [`main`](../../tree/main). Retail readouts that only moved to make room for the mirror (WRONG WAY,
+> multiplayer rank/points and point status) stay in their retail places here; the mirror tuning tools
+> below only matter with the mirror.
 
 ![Prototype HUD running in the retail PC game](docs/preview.webp)
 
@@ -32,7 +35,7 @@ python install.py                     :: install everything built (originals bac
 python install.py --restore           :: restore the originals
 ```
 
-Options: `--no-mirror` (no rear-view mirror), `--no-damage-lights` (no damage indicator), `--out-root DIR`
+Options: `--mirror` (add the rear-view mirror), `--no-damage-lights` (no damage indicator), `--out-root DIR`
 (build into `DIR\UI\SCREENS2\`, e.g. `out\variants\no-mirror`; `install.py --variant no-mirror` installs it).
 Preview renderer: `python render.py <bundle> <image.png> [--pc]`.
 
